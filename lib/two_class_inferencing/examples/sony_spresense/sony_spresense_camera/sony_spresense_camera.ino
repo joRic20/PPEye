@@ -1,5 +1,5 @@
 /* Edge Impulse ingestion SDK
- * Copyright (c) 2022 EdgeImpulse Inc.
+ * Copyright (c) 2023 EdgeImpulse Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,36 +16,19 @@
 
 /* Includes ---------------------------------------------------------------- */
 #include <two_class_inferencing.h>
-#include <rgb_lcd.h>
 
 #include "edge-impulse-sdk/dsp/image/image.hpp"
-
-#include "camera.h"
-#include "gc2145.h"
-#include <ea_malloc.h>
-
-/* Constant defines -------------------------------------------------------- */
-#define EI_CAMERA_RAW_FRAME_BUFFER_COLS           320
-#define EI_CAMERA_RAW_FRAME_BUFFER_ROWS           240
-#define EI_CAMERA_RAW_FRAME_BYTE_SIZE             2
-
-// Detection confidence threshold (adjust as needed)
-#define CONFIDENCE_THRESHOLD                      0.5
+#include "Camera.h"
 
 /*
- ** NOTE: If you run into TFLite arena allocation issue.
- **
- ** This may be due to may dynamic memory fragmentation.
- ** Try defining "-DEI_CLASSIFIER_ALLOCATION_STATIC" in boards.local.txt (create
- ** if it doesn't exist) and copy this file to
- ** `<ARDUINO_CORE_INSTALL_PATH>/arduino/hardware/<mbed_core>/<core_version>/`.
- **
- ** See
- ** (https://support.arduino.cc/hc/en-us/articles/360012076960-Where-are-the-installed-cores-located-)
- ** to find where Arduino installs cores on your machine.
- **
- ** If the problem persists then there's not enough memory for this model and application.
- */
+ * IMPORTANT In Tools->Board select the Spresense device, then under Tools->Memory select 1536(kB).
+ * We do not need the audio or multi-core memory layouts for this project, but we do need as much memory available as possible for NN and image storage.
+*/
+
+/* Constant defines -------------------------------------------------------- */
+#define EI_CAMERA_RAW_FRAME_BUFFER_COLS           CAM_IMGSIZE_QVGA_H
+#define EI_CAMERA_RAW_FRAME_BUFFER_ROWS           CAM_IMGSIZE_QVGA_V
+#define EI_CAMERA_RAW_FRAME_BYTE_SIZE             2
 
 #define ALIGN_PTR(p,a)   ((p & (a-1)) ?(((uintptr_t)p + a) & ~(uintptr_t)(a-1)) : p)
 
@@ -61,7 +44,8 @@ typedef struct {
  *
  * @return     Returns number of available bytes
  */
-int ei_get_serial_available(void) {
+int ei_get_serial_available(void)
+{
     return Serial.available();
 }
 
@@ -70,39 +54,26 @@ int ei_get_serial_available(void) {
  *
  * @return     byte
  */
-char ei_get_serial_byte(void) {
+char ei_get_serial_byte(void)
+{
     return Serial.read();
 }
 
 /* Private variables ------------------------------------------------------- */
 static bool debug_nn = false; // Set this to true to see e.g. features generated from the raw signal
 static bool is_initialised = false;
-static bool is_ll_initialised = false;
-
-GC2145 galaxyCore;
-Camera cam(galaxyCore);
-FrameBuffer fb;
-
-// LCD setup - Grove RGB LCD
-rgb_lcd lcd;
 
 /*
 ** @brief points to the output of the capture
 */
 static uint8_t *ei_camera_capture_out = NULL;
 
-/*
-** @brief used to store the raw frame
-*/
-static uint8_t *ei_camera_frame_mem;
-static uint8_t *ei_camera_frame_buffer; // 32-byte aligned
-
 /* Function definitions ------------------------------------------------------- */
 bool ei_camera_init(void);
 void ei_camera_deinit(void);
 bool ei_camera_capture(uint32_t img_width, uint32_t img_height, uint8_t *out_buf) ;
 int calculate_resize_dimensions(uint32_t out_width, uint32_t out_height, uint32_t *resize_col_sz, uint32_t *resize_row_sz, bool *do_resize);
-void displayAccessResult(bool helmetDetected, bool vestDetected);
+static int ei_camera_get_data(size_t offset, size_t length, float *out_ptr);
 
 /**
 * @brief      Arduino setup function
@@ -111,43 +82,16 @@ void setup()
 {
     // put your setup code here, to run once:
     Serial.begin(115200);
+
     // comment out the below line to cancel the wait for USB connection (needed for native USB)
     while (!Serial);
-    Serial.println("PPE Detection System with LCD");
-
-    // Initialize Grove RGB LCD
-    lcd.begin(16, 2);
-    lcd.setRGB(0, 255, 0);  // Green backlight
-    lcd.setCursor(0, 0);
-    lcd.print("PPE Detection");
-    lcd.setCursor(0, 1);
-    lcd.print("Initializing...");
-    
-    delay(2000); // Show init message for 2 seconds
-
-    // initialise M4 RAM
-    // Arduino Nicla Vision has 512KB of RAM allocated for M7 core
-    // and additional 244k (sic!) on the M4 address space
-    // allocating 288 kB as in the line below was
-    // advised by a member of Arduino team
-    malloc_addblock((void*)0x30000000, 288 * 1024);
+    Serial.println("Edge Impulse Inferencing Demo");
 
     if (ei_camera_init() == false) {
         ei_printf("Failed to initialize Camera!\r\n");
-        lcd.clear();
-        lcd.setRGB(255, 0, 0);  // Red for error
-        lcd.setCursor(0, 0);
-        lcd.print("Camera Error!");
-        while(1); // Stop execution
     }
     else {
         ei_printf("Camera initialized\r\n");
-        lcd.clear();
-        lcd.setRGB(0, 255, 0);  // Green for ready
-        lcd.setCursor(0, 0);
-        lcd.print("System Ready");
-        lcd.setCursor(0, 1);
-        lcd.print("Starting scan...");
     }
 }
 
@@ -160,31 +104,20 @@ void loop()
 {
     ei_printf("\nStarting inferencing in 2 seconds...\n");
 
-    // instead of wait_ms, we'll wait on the signal, this allows threads to cancel us...
     if (ei_sleep(2000) != EI_IMPULSE_OK) {
         return;
     }
 
     ei_printf("Taking photo...\n");
-    
-    // Update LCD to show scanning
-    lcd.clear();
-    lcd.setRGB(0, 0, 255);  // Blue backlight for scanning
-    lcd.setCursor(0, 0);
-    lcd.print("Scanning...");
+
+    if (ei_camera_capture((size_t)EI_CLASSIFIER_INPUT_WIDTH, (size_t)EI_CLASSIFIER_INPUT_HEIGHT, NULL) == false) {
+        ei_printf("Failed to capture image\r\n");
+        return;
+    }
 
     ei::signal_t signal;
     signal.total_length = EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT;
     signal.get_data = &ei_camera_get_data;
-
-    if (ei_camera_capture((size_t)EI_CLASSIFIER_INPUT_WIDTH, (size_t)EI_CLASSIFIER_INPUT_HEIGHT, NULL) == false) {
-        ei_printf("Failed to capture image\r\n");
-        lcd.clear();
-        lcd.setRGB(255, 0, 0);  // Red for error
-        lcd.setCursor(0, 0);
-        lcd.print("Capture Error!");
-        return;
-    }
 
     // Run the classifier
     ei_impulse_result_t result = { 0 };
@@ -192,29 +125,19 @@ void loop()
     EI_IMPULSE_ERROR err = run_classifier(&signal, &result, debug_nn);
     if (err != EI_IMPULSE_OK) {
         ei_printf("ERR: Failed to run classifier (%d)\n", err);
-        lcd.clear();
-        lcd.setRGB(255, 0, 0);  // Red for error
-        lcd.setCursor(0, 0);
-        lcd.print("AI Error!");
         return;
     }
 
     // print the predictions
     ei_printf("Predictions (DSP: %d ms., Classification: %d ms., Anomaly: %d ms.): \n",
                 result.timing.dsp, result.timing.classification, result.timing.anomaly);
-
-    // Check for PPE detection
-    bool helmetDetected = false;
-    bool vestDetected = false;
-
 #if EI_CLASSIFIER_OBJECT_DETECTION == 1
     ei_printf("Object detection bounding boxes:\r\n");
     for (uint32_t i = 0; i < result.bounding_boxes_count; i++) {
         ei_impulse_result_bounding_box_t bb = result.bounding_boxes[i];
-        if (bb.value < CONFIDENCE_THRESHOLD) {
-            continue; // Skip low confidence detections
+        if (bb.value == 0) {
+            continue;
         }
-        
         ei_printf("  %s (%f) [ x: %u, y: %u, width: %u, height: %u ]\r\n",
                 bb.label,
                 bb.value,
@@ -222,21 +145,7 @@ void loop()
                 bb.y,
                 bb.width,
                 bb.height);
-
-        // Check for helmet and vest (case-insensitive)
-        String label = String(bb.label);
-        label.toLowerCase();
-        
-        if (label.indexOf("helmet") >= 0) {
-            helmetDetected = true;
-        }
-        if (label.indexOf("vest") >= 0) {
-            vestDetected = true;
-        }
     }
-
-    // Display results on LCD and Serial
-    displayAccessResult(helmetDetected, vestDetected);
 
     // Print the prediction results (classification)
 #else
@@ -244,23 +153,7 @@ void loop()
     for (uint16_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
         ei_printf("  %s: ", ei_classifier_inferencing_categories[i]);
         ei_printf("%.5f\r\n", result.classification[i].value);
-        
-        // For classification mode, check class predictions
-        if (result.classification[i].value > CONFIDENCE_THRESHOLD) {
-            String label = String(ei_classifier_inferencing_categories[i]);
-            label.toLowerCase();
-            
-            if (label.indexOf("helmet") >= 0) {
-                helmetDetected = true;
-            }
-            if (label.indexOf("vest") >= 0) {
-                vestDetected = true;
-            }
-        }
     }
-    
-    // Display results on LCD
-    displayAccessResult(helmetDetected, vestDetected);
 #endif
 
     // Print anomaly result (if it exists)
@@ -287,62 +180,59 @@ void loop()
 }
 
 /**
- * @brief      Display access control result on LCD
- * @param[in]  helmetDetected  True if helmet was detected
- * @param[in]  vestDetected    True if vest was detected
- */
-void displayAccessResult(bool helmetDetected, bool vestDetected) {
-    lcd.clear();
-    
-    if (helmetDetected && vestDetected) {
-        // Access granted - Green backlight
-        ei_printf("ACCESS GRANTED: Both helmet and vest detected!\r\n");
-        lcd.setRGB(0, 255, 0);  // Green
-        lcd.setCursor(0, 0);
-        lcd.print("Helmet & Vest");
-        lcd.setCursor(0, 1);
-        lcd.print("Access GRANTED");
-    } else {
-        // Access denied - Red backlight
-        ei_printf("ACCESS DENIED: Missing PPE (Helmet: %s, Vest: %s)\r\n", 
-                  helmetDetected ? "YES" : "NO", 
-                  vestDetected ? "YES" : "NO");
-        lcd.setRGB(255, 0, 0);  // Red
-        lcd.setCursor(0, 0);
-        lcd.print("No Helmet & Vest");
-        lcd.setCursor(0, 1);
-        lcd.print("Access DENIED");
-    }
-    
-    // Show result for 3 seconds before next scan
-    delay(3000);
-}
-
-/**
  * @brief   Setup image sensor & start streaming
  *
  * @retval  false if initialisation failed
  */
-bool ei_camera_init(void) {
-    if (is_initialised) return true;
+bool ei_camera_init(void)
+{
+    CamErr err;
+    if (is_initialised) {
+        return true;
+    }
 
-    if (is_ll_initialised == false) {
-        if (!cam.begin(CAMERA_R320x240, CAMERA_RGB565, -1)) {
-            ei_printf("ERR: Failed to initialise camera\r\n");
-            return false;
-        }
-
-    // initialize frame buffer
-    ei_camera_frame_mem = (uint8_t *) ei_malloc(EI_CAMERA_RAW_FRAME_BUFFER_COLS * EI_CAMERA_RAW_FRAME_BUFFER_ROWS * EI_CAMERA_RAW_FRAME_BYTE_SIZE + 32 /*alignment*/);
-    if(ei_camera_frame_mem == NULL) {
-        ei_printf("failed to create ei_camera_frame_mem\r\n");
+    Serial.println("Prepare camera");
+    err = theCamera.begin();
+    if (err != CAM_ERR_SUCCESS) {
+        ei_printf("Camera begin failed\r\n");
         return false;
     }
-    ei_camera_frame_buffer = (uint8_t *)ALIGN_PTR((uintptr_t)ei_camera_frame_mem, 32);
-
-    fb.setBuffer(ei_camera_frame_buffer);
-    is_initialised = true;
+    if (theCamera.getDeviceType() == CAM_DEVICE_TYPE_UNKNOWN) {
+        ei_printf("Camera not found\r\n");
+        return false;
     }
+
+    /* Auto white balance configuration */
+    Serial.println("Set Auto white balance parameter");
+    err = theCamera.setAutoWhiteBalanceMode(CAM_WHITE_BALANCE_AUTO);
+    if (err != CAM_ERR_SUCCESS) {
+        ei_printf("Auto white balancing setup failed\r\n");
+        return false;
+    }
+
+    /* Set parameters about still picture.
+    * In the following case, QVGA and YUV422.
+    */
+    Serial.println("Set still picture format");
+    err = theCamera.setStillPictureImageFormat(
+        EI_CAMERA_RAW_FRAME_BUFFER_COLS,
+        EI_CAMERA_RAW_FRAME_BUFFER_ROWS,
+        CAM_IMAGE_PIX_FMT_YUV422);
+
+    if (err != CAM_ERR_SUCCESS) {
+        ei_printf("Camera set still image failed: %d\r\n", err);
+        return false;
+    }
+
+    ei_camera_capture_out = (uint8_t*)ei_malloc(EI_CAMERA_RAW_FRAME_BUFFER_COLS * EI_CAMERA_RAW_FRAME_BUFFER_ROWS * 3 + 32);
+    ei_camera_capture_out = (uint8_t *)ALIGN_PTR((uintptr_t)ei_camera_capture_out, 32);
+
+    if (ei_camera_capture_out == nullptr) {
+        ei_printf("ERR: Failed to allocate memory for capture buffer\r\n");
+        return false;
+    }
+
+    is_initialised = true;
 
     return true;
 }
@@ -350,11 +240,10 @@ bool ei_camera_init(void) {
 /**
  * @brief      Stop streaming of sensor data
  */
-void ei_camera_deinit(void) {
-
-    ei_free(ei_camera_frame_mem);
-    ei_camera_frame_mem = NULL;
-    ei_camera_frame_buffer = NULL;
+void ei_camera_deinit(void)
+{
+    ei_free(ei_camera_capture_out);
+    ei_camera_capture_out = nullptr;
     is_initialised = false;
 }
 
@@ -369,29 +258,27 @@ void ei_camera_deinit(void) {
  * @retval     false if not initialised, image captured, rescaled or cropped failed
  *
  */
-bool ei_camera_capture(uint32_t img_width, uint32_t img_height, uint8_t *out_buf) {
+bool ei_camera_capture(uint32_t img_width, uint32_t img_height, uint8_t *out_buf)
+{
     bool do_resize = false;
     bool do_crop = false;
-
-    ei_camera_capture_out = (uint8_t*)ea_malloc(EI_CAMERA_RAW_FRAME_BUFFER_COLS * EI_CAMERA_RAW_FRAME_BUFFER_ROWS * 3 + 32);
-    ei_camera_capture_out = (uint8_t *)ALIGN_PTR((uintptr_t)ei_camera_capture_out, 32);
 
     if (!is_initialised) {
         ei_printf("ERR: Camera is not initialized\r\n");
         return false;
     }
 
-    int snapshot_response = cam.grabFrame(fb, 100);
-    if (snapshot_response != 0) {
-        ei_printf("ERR: Failed to get snapshot (%d)\r\n", snapshot_response);
+    CamImage img = theCamera.takePicture();
+
+    if (img.isAvailable() != true) {
+        ei_printf("ERR: Failed to get snapshot\r\n");
         return false;
     }
 
-    bool converted = RBG565ToRGB888(ei_camera_frame_buffer, ei_camera_capture_out, cam.frameSize());
 
-    if(!converted){
+    // we take snapshot in yuv422
+    if (ei::EIDSP_OK != ei::image::processing::yuv422_to_rgb888(ei_camera_capture_out, img.getImgBuff(), img.getImgSize(), ei::image::processing::BIG_ENDIAN_ORDER)) {
         ei_printf("ERR: Conversion failed\n");
-        ei_free(ei_camera_frame_mem);
         return false;
     }
 
@@ -410,7 +297,6 @@ bool ei_camera_capture(uint32_t img_width, uint32_t img_height, uint8_t *out_buf
     }
 
     if (do_resize) {
-
           ei::image::processing::crop_and_interpolate_rgb888(
           ei_camera_capture_out,
           EI_CAMERA_RAW_FRAME_BUFFER_COLS,
@@ -420,7 +306,6 @@ bool ei_camera_capture(uint32_t img_width, uint32_t img_height, uint8_t *out_buf
           resize_row_sz);
     }
 
-    ea_free(ei_camera_capture_out);
     return true;
 }
 

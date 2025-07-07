@@ -16,7 +16,6 @@
 
 /* Includes ---------------------------------------------------------------- */
 #include <two_class_inferencing.h>
-#include <rgb_lcd.h>
 
 #include "edge-impulse-sdk/dsp/image/image.hpp"
 
@@ -28,9 +27,6 @@
 #define EI_CAMERA_RAW_FRAME_BUFFER_COLS           320
 #define EI_CAMERA_RAW_FRAME_BUFFER_ROWS           240
 #define EI_CAMERA_RAW_FRAME_BYTE_SIZE             2
-
-// Detection confidence threshold (adjust as needed)
-#define CONFIDENCE_THRESHOLD                      0.5
 
 /*
  ** NOTE: If you run into TFLite arena allocation issue.
@@ -83,9 +79,6 @@ GC2145 galaxyCore;
 Camera cam(galaxyCore);
 FrameBuffer fb;
 
-// LCD setup - Grove RGB LCD
-rgb_lcd lcd;
-
 /*
 ** @brief points to the output of the capture
 */
@@ -102,7 +95,6 @@ bool ei_camera_init(void);
 void ei_camera_deinit(void);
 bool ei_camera_capture(uint32_t img_width, uint32_t img_height, uint8_t *out_buf) ;
 int calculate_resize_dimensions(uint32_t out_width, uint32_t out_height, uint32_t *resize_col_sz, uint32_t *resize_row_sz, bool *do_resize);
-void displayAccessResult(bool helmetDetected, bool vestDetected);
 
 /**
 * @brief      Arduino setup function
@@ -113,17 +105,7 @@ void setup()
     Serial.begin(115200);
     // comment out the below line to cancel the wait for USB connection (needed for native USB)
     while (!Serial);
-    Serial.println("PPE Detection System with LCD");
-
-    // Initialize Grove RGB LCD
-    lcd.begin(16, 2);
-    lcd.setRGB(0, 255, 0);  // Green backlight
-    lcd.setCursor(0, 0);
-    lcd.print("PPE Detection");
-    lcd.setCursor(0, 1);
-    lcd.print("Initializing...");
-    
-    delay(2000); // Show init message for 2 seconds
+    Serial.println("Edge Impulse Inferencing Demo");
 
     // initialise M4 RAM
     // Arduino Nicla Vision has 512KB of RAM allocated for M7 core
@@ -134,20 +116,9 @@ void setup()
 
     if (ei_camera_init() == false) {
         ei_printf("Failed to initialize Camera!\r\n");
-        lcd.clear();
-        lcd.setRGB(255, 0, 0);  // Red for error
-        lcd.setCursor(0, 0);
-        lcd.print("Camera Error!");
-        while(1); // Stop execution
     }
     else {
         ei_printf("Camera initialized\r\n");
-        lcd.clear();
-        lcd.setRGB(0, 255, 0);  // Green for ready
-        lcd.setCursor(0, 0);
-        lcd.print("System Ready");
-        lcd.setCursor(0, 1);
-        lcd.print("Starting scan...");
     }
 }
 
@@ -166,12 +137,6 @@ void loop()
     }
 
     ei_printf("Taking photo...\n");
-    
-    // Update LCD to show scanning
-    lcd.clear();
-    lcd.setRGB(0, 0, 255);  // Blue backlight for scanning
-    lcd.setCursor(0, 0);
-    lcd.print("Scanning...");
 
     ei::signal_t signal;
     signal.total_length = EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT;
@@ -179,10 +144,6 @@ void loop()
 
     if (ei_camera_capture((size_t)EI_CLASSIFIER_INPUT_WIDTH, (size_t)EI_CLASSIFIER_INPUT_HEIGHT, NULL) == false) {
         ei_printf("Failed to capture image\r\n");
-        lcd.clear();
-        lcd.setRGB(255, 0, 0);  // Red for error
-        lcd.setCursor(0, 0);
-        lcd.print("Capture Error!");
         return;
     }
 
@@ -192,29 +153,19 @@ void loop()
     EI_IMPULSE_ERROR err = run_classifier(&signal, &result, debug_nn);
     if (err != EI_IMPULSE_OK) {
         ei_printf("ERR: Failed to run classifier (%d)\n", err);
-        lcd.clear();
-        lcd.setRGB(255, 0, 0);  // Red for error
-        lcd.setCursor(0, 0);
-        lcd.print("AI Error!");
         return;
     }
 
     // print the predictions
     ei_printf("Predictions (DSP: %d ms., Classification: %d ms., Anomaly: %d ms.): \n",
                 result.timing.dsp, result.timing.classification, result.timing.anomaly);
-
-    // Check for PPE detection
-    bool helmetDetected = false;
-    bool vestDetected = false;
-
 #if EI_CLASSIFIER_OBJECT_DETECTION == 1
     ei_printf("Object detection bounding boxes:\r\n");
     for (uint32_t i = 0; i < result.bounding_boxes_count; i++) {
         ei_impulse_result_bounding_box_t bb = result.bounding_boxes[i];
-        if (bb.value < CONFIDENCE_THRESHOLD) {
-            continue; // Skip low confidence detections
+        if (bb.value == 0) {
+            continue;
         }
-        
         ei_printf("  %s (%f) [ x: %u, y: %u, width: %u, height: %u ]\r\n",
                 bb.label,
                 bb.value,
@@ -222,21 +173,7 @@ void loop()
                 bb.y,
                 bb.width,
                 bb.height);
-
-        // Check for helmet and vest (case-insensitive)
-        String label = String(bb.label);
-        label.toLowerCase();
-        
-        if (label.indexOf("helmet") >= 0) {
-            helmetDetected = true;
-        }
-        if (label.indexOf("vest") >= 0) {
-            vestDetected = true;
-        }
     }
-
-    // Display results on LCD and Serial
-    displayAccessResult(helmetDetected, vestDetected);
 
     // Print the prediction results (classification)
 #else
@@ -244,23 +181,7 @@ void loop()
     for (uint16_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
         ei_printf("  %s: ", ei_classifier_inferencing_categories[i]);
         ei_printf("%.5f\r\n", result.classification[i].value);
-        
-        // For classification mode, check class predictions
-        if (result.classification[i].value > CONFIDENCE_THRESHOLD) {
-            String label = String(ei_classifier_inferencing_categories[i]);
-            label.toLowerCase();
-            
-            if (label.indexOf("helmet") >= 0) {
-                helmetDetected = true;
-            }
-            if (label.indexOf("vest") >= 0) {
-                vestDetected = true;
-            }
-        }
     }
-    
-    // Display results on LCD
-    displayAccessResult(helmetDetected, vestDetected);
 #endif
 
     // Print anomaly result (if it exists)
@@ -284,38 +205,6 @@ void loop()
                 bb.height);
     }
 #endif
-}
-
-/**
- * @brief      Display access control result on LCD
- * @param[in]  helmetDetected  True if helmet was detected
- * @param[in]  vestDetected    True if vest was detected
- */
-void displayAccessResult(bool helmetDetected, bool vestDetected) {
-    lcd.clear();
-    
-    if (helmetDetected && vestDetected) {
-        // Access granted - Green backlight
-        ei_printf("ACCESS GRANTED: Both helmet and vest detected!\r\n");
-        lcd.setRGB(0, 255, 0);  // Green
-        lcd.setCursor(0, 0);
-        lcd.print("Helmet & Vest");
-        lcd.setCursor(0, 1);
-        lcd.print("Access GRANTED");
-    } else {
-        // Access denied - Red backlight
-        ei_printf("ACCESS DENIED: Missing PPE (Helmet: %s, Vest: %s)\r\n", 
-                  helmetDetected ? "YES" : "NO", 
-                  vestDetected ? "YES" : "NO");
-        lcd.setRGB(255, 0, 0);  // Red
-        lcd.setCursor(0, 0);
-        lcd.print("No Helmet & Vest");
-        lcd.setCursor(0, 1);
-        lcd.print("Access DENIED");
-    }
-    
-    // Show result for 3 seconds before next scan
-    delay(3000);
 }
 
 /**
